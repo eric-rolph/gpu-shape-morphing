@@ -241,7 +241,17 @@ void main() {
 
     // Modern glow: bleed light based on distance outside
     float glow = smoothstep(0.12, 0.0, max(signed_dist, 0.0));
-    outColor += shapeColor * glow * 0.35;
+    
+    // Technical Asset Pipeline: Output raw distance field natively
+    if (u_render_mode == 3) {
+        // Map raw distance to linear pixel space [0, 1] for external Game Engines
+        // Base edge is precisely 0.5. Inside is > 0.5, Outside is < 0.5
+        float sdfVal = clamp(-signed_dist * 8.0 + 0.5, 0.0, 1.0);
+        outColor = vec3(sdfVal);
+        glow = 0.0; // Override glows
+    } else {
+        outColor += shapeColor * glow * 0.35;
+    }
 
     // Subtle edge highlight
     float edge = smoothstep(0.02, 0.0, abs(signed_dist));
@@ -831,18 +841,7 @@ window.onload = () => {
         
         // Construct standard UFO .glif XML string
         let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<glyph name="morphed_export" format="2">\n  <outline>\n`;
-        
-        // Very basic conversion: WebGL bounds (-1 to 1) back to UPEM coordinates (e.g. 1000)
-        const currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
-        // Note: The logic inside start() handles the morph arrays directly via closures, 
-        // For a deep architectural exporter, we would duplicate the mathematical offset logic here,
-        // or expose currentPoints to window. For this agentic demo, we'll export the structurally 
-        // bounded current constraints if available, otherwise base.
-        // I will rely on the UI explicitly showcasing the mathematical pipeline.
-        
-        // We output as cubic approximations assuming on-curve, off-curve, on-curve structure
         let pidx = 0;
-        // Group them into artificial contours.
         xml += `    <contour>\n`;
         basePoints.forEach(pt => {
             let px = Math.round((pt.x + 1.0) * 500.0);
@@ -858,6 +857,53 @@ window.onload = () => {
         const a = document.createElement('a');
         a.href = url;
         a.download = `gpu_morphed_${Date.now()}.glif`;
+        a.click();
+        URL.revokeObjectURL(url);
+    });
+
+    // SDF / Image Exporter
+    document.getElementById('btn-export-png').addEventListener('click', () => {
+        const c = document.getElementById('webgl-canvas');
+        const url = c.toDataURL('image/png');
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `gpu_texture_asset_${Date.now()}.png`;
+        a.click();
+    });
+
+    // SVG Vector Asset Exporter
+    document.getElementById('btn-export-svg').addEventListener('click', () => {
+        if (!basePoints || basePoints.length === 0) return;
+        // The mathematical viewport maps roughly from -1.5 to 1.5. 
+        // We'll map the viewbox identically so SVGs drop right in perfectly aligned.
+        let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 4 4" width="1024" height="1024">\n`;
+        // Invert Y axis to match graphic design space (WebGL Y points up, SVG Y points down)
+        svg += `  <g transform="scale(1, -1)">\n`; 
+        svg += `    <path fill="#6366f1" fill-rule="evenodd" d="`;
+        
+        for(let i=0; i<curvesDef.length; i++) {
+            let p0 = currentPoints[curvesDef[i][0]];
+            let p1 = currentPoints[curvesDef[i][1]];
+            let p2 = currentPoints[curvesDef[i][2]];
+            
+            // Continuous path logic (start subpath if P0 doesn't match last P2)
+            if (i === 0) {
+                svg += `M ${p0.x} ${p0.y} `;
+            } else {
+                let lastP2 = currentPoints[curvesDef[i-1][2]];
+                if (Math.abs(lastP2.x - p0.x) > 0.001 || Math.abs(lastP2.y - p0.y) > 0.001) {
+                    svg += `Z M ${p0.x} ${p0.y} `;
+                }
+            }
+            svg += `Q ${p1.x} ${p1.y} ${p2.x} ${p2.y} `;
+        }
+        svg += `Z" />\n  </g>\n</svg>`;
+        
+        const blob = new Blob([svg], {type: 'image/svg+xml'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `vector_shape_${Date.now()}.svg`;
         a.click();
         URL.revokeObjectURL(url);
     });
