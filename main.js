@@ -14,17 +14,16 @@ const fragmentShaderSource = `#version 300 es
 precision highp float;
 
 // Arrays containing the points of our quadratic Bezier curves
-// Max 20 curves for this demo
-uniform vec2 u_p0[150];
-uniform vec2 u_p1[150];
-uniform vec2 u_p2[150];
+uniform vec2 u_p0[350];
+uniform vec2 u_p1[350];
+uniform vec2 u_p2[350];
 uniform int u_num_curves;
 
 uniform vec2 u_resolution;
 uniform float u_time;
 uniform int u_render_mode;
 uniform bool u_show_flaws;
-uniform float u_kink_flags[150];
+uniform float u_kink_flags[350];
 
 uniform vec2 u_offset;
 uniform float u_zoom;
@@ -401,7 +400,7 @@ function start() {
     attachSliderUpdate(tensionEl, tensionValEl);
 
     // Maximum geometric limits setup
-    const MAX_CURVES = 150;
+    const MAX_CURVES = 350;
     let p0Array = new Float32Array(MAX_CURVES * 2);
     let p1Array = new Float32Array(MAX_CURVES * 2);
     let p2Array = new Float32Array(MAX_CURVES * 2);
@@ -644,9 +643,87 @@ function start() {
     requestAnimationFrame(render);
 }
 
-// Robust .glif parsing function (Unified Font Object) Integration
+// Global cache for opentype font object
+let activeFont = null;
+
+// Convert opentype.js paths into geometric curves
+function updateFontPreview(text) {
+    if (!activeFont || !text) return;
+    
+    const path = activeFont.getPath(text, 0, 0, 1000);
+    const newPoints = [];
+    const newCurves = [];
+    let pid = 0;
+    
+    let currentX = 0, currentY = 0;
+    
+    // Bounds tracking
+    const bounds = {minX:10000, maxX:-10000, minY:10000, maxY:-10000};
+    
+    path.commands.forEach(cmd => {
+        let x = cmd.x || currentX;
+        let y = cmd.y || currentY;
+        bounds.minX = Math.min(bounds.minX, x);
+        bounds.maxX = Math.max(bounds.maxX, x);
+        // opentype.js Y-axis is inverted relative to webgl mathematical plane often, but let's map generally
+        bounds.minY = Math.min(bounds.minY, y);
+        bounds.maxY = Math.max(bounds.maxY, y);
+    });
+    
+    let scale = 1.6 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+    let offsetX = -(bounds.minX + bounds.maxX) * 0.5 * scale;
+    let offsetY = -(bounds.minY + bounds.maxY) * 0.5 * scale;
+
+    const addCurve = (p0x, p0y, p1x, p1y, p2x, p2y) => {
+        let scP0 = {x: p0x * scale + offsetX, y: -(p0y * scale + offsetY)};
+        let scP1 = {x: p1x * scale + offsetX, y: -(p1y * scale + offsetY)};
+        let scP2 = {x: p2x * scale + offsetX, y: -(p2y * scale + offsetY)};
+        
+        const idx = newPoints.length;
+        newPoints.push({id: idx, x: scP0.x, y: scP0.y});
+        newPoints.push({id: idx+1, x: scP1.x, y: scP1.y});
+        newPoints.push({id: idx+2, x: scP2.x, y: scP2.y});
+        newCurves.push([idx, idx+1, idx+2]);
+    };
+
+    path.commands.forEach(cmd => {
+        if (cmd.type === 'M') { currentX = cmd.x; currentY = cmd.y; }
+        else if (cmd.type === 'L') {
+            // Convert line to exact quadratic
+            let cx = (currentX + cmd.x)/2; let cy = (currentY + cmd.y)/2;
+            addCurve(currentX, currentY, cx, cy, cmd.x, cmd.y);
+            currentX = cmd.x; currentY = cmd.y;
+        }
+        else if (cmd.type === 'Q') {
+            addCurve(currentX, currentY, cmd.x1, cmd.y1, cmd.x, cmd.y);
+            currentX = cmd.x; currentY = cmd.y;
+        }
+        else if (cmd.type === 'C') {
+            // Rough cubic -> quad approximation (midpoint of controls)
+            let cx = (cmd.x1 + cmd.x2)/2; let cy = (cmd.y1 + cmd.y2)/2;
+            addCurve(currentX, currentY, cx, cy, cmd.x, cmd.y);
+            currentX = cmd.x; currentY = cmd.y;
+        }
+        else if (cmd.type === 'Z') { /* Path closed */ }
+    });
+
+    if (newCurves.length > 0 && newCurves.length <= 350) {
+        basePoints.length = 0; basePoints.push(...newPoints);
+        curvesDef.length = 0; curvesDef.push(...newCurves);
+    } else {
+        alert(`String too complex. Contains ${newCurves.length} geometric curves (Max 350). Try fewer characters.`);
+    }
+}
+
+// Robust parsing function Integration
 function addDragAndDropSupport() {
     const dropZone = document.getElementById('drop-zone');
+    const liveTextUI = document.getElementById('live-text-container');
+    const liveTextInput = document.getElementById('live-text');
+    
+    liveTextInput.addEventListener('input', (e) => {
+        updateFontPreview(e.target.value || " ");
+    });
     
     document.body.addEventListener('dragover', (e) => {
         e.preventDefault();
@@ -663,8 +740,29 @@ function addDragAndDropSupport() {
         dropZone.classList.remove('active');
         
         const file = e.dataTransfer.files[0];
-        if (!file || !file.name.endsWith('.glif')) return alert('Please drop a valid .glif UFO file.');
+        if (!file) return;
         
+        if (file.name.endsWith('.ttf') || file.name.endsWith('.otf') || file.name.endsWith('.woff')) {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                try {
+                    activeFont = opentype.parse(ev.target.result);
+                    liveTextUI.style.display = 'block';
+                    updateFontPreview(liveTextInput.value);
+                } catch (err) {
+                    alert('Could not parse OpenType font format.');
+                    console.error(err);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+            return;
+        }
+        
+        if (!file.name.endsWith('.glif')) return alert('Please drop a valid .ttf, .otf, or .glif file.');
+        
+        activeFont = null;
+        liveTextUI.style.display = 'none';
+
         const reader = new FileReader();
         reader.onload = (ev) => {
             const parser = new DOMParser();
@@ -710,11 +808,11 @@ function addDragAndDropSupport() {
                 }
             });
 
-            if (newCurves.length > 0 && newCurves.length < 150) {
+            if (newCurves.length > 0 && newCurves.length <= 350) {
                 basePoints.length = 0; basePoints.push(...newPoints);
                 curvesDef.length = 0; curvesDef.push(...newCurves);
             } else {
-                alert("File contains too many curves for standalone browser prototype (" + newCurves.length + "/150 max).");
+                alert("File contains too many curves for standalone browser prototype (" + newCurves.length + "/350 max).");
             }
         };
         reader.readAsText(file);
