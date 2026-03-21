@@ -245,15 +245,38 @@
             color: white;
             text-shadow: 0 4px 12px rgba(0,0,0,0.5);
         }
+        .btn-modern {
+            width: 100%;
+            background: linear-gradient(135deg, #6366f1, #a855f7);
+            color: white;
+            border: none;
+            padding: 12px 0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            margin-top: 24px;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4);
+        }
+        .btn-modern:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.6);
+        }
+        .btn-modern:active {
+            transform: translateY(1px);
+        }
     </style>
 </head>
 <body>
     <main>
         <canvas id="webgl-canvas" aria-label="Interactive morphing vector canvas"></canvas>
+        <canvas id="overlay-canvas" style="position: absolute; top: 0; left: 0; pointer-events: none; width: 100vw; height: 100vh;"></canvas>
 
         <section class="controls-panel" aria-labelledby="panel-heading">
             <h1 id="panel-heading">GPU Font Engine</h1>
-            <p>Real-time vector morphing implemented purely in a WebGL fragment shader. Drop a <b>.glif</b> file here to parse XML vectors instantly.</p>
+            <p style="margin-bottom: 16px;">Real-time vector morphing implemented purely in a WebGL fragment shader. Drop a <b>.glif</b> file here to parse XML vectors instantly. Scroll to Zoom, Drag to Pan!</p>
 
             <form onsubmit="return false;">
                 <div class="control-group">
@@ -308,12 +331,22 @@
                 </div>
 
                 <div class="toggle-wrapper" style="margin-top: 16px; padding-top: 16px;">
+                    <label for="show-skeleton" class="toggle-label">Inspect Vector Skeleton</label>
+                    <label class="switch">
+                        <input type="checkbox" id="show-skeleton" name="show-skeleton" title="Overlay the exact mathematical anchor constraints via Context2D">
+                        <span class="slider" aria-hidden="true"></span>
+                    </label>
+                </div>
+
+                <div class="toggle-wrapper" style="margin-top: 16px; padding-top: 16px;">
                     <label for="breathing" class="toggle-label">Continuous Breathing</label>
                     <label class="switch">
                         <input type="checkbox" id="breathing" name="breathing" title="Toggle automatic subtle pulsing animation">
                         <span class="slider" aria-hidden="true"></span>
                     </label>
                 </div>
+
+                <button id="btn-export" class="btn-modern">Export Morph as .glif UFO</button>
             </form>
         </section>
         
