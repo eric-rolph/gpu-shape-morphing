@@ -27,7 +27,9 @@ in vec2 v_uv;
 out vec4 fragColor;
 
 // Exact mathematical distance to a quadratic Bezier curve
-// Adapted math based on standard algebraic roots for Bezier distances
+// Adapted math by Inigo Quilez, evaluating the derivative of the distance squared 
+// function to find the closest algebraic roots. This method eliminates the need
+// for coarse bounding geometries or texture atlases.
 float sdBezier(vec2 pos, vec2 A, vec2 B, vec2 C) {    
     vec2 a = B - A;
     vec2 b = A - 2.0*B + C;
@@ -242,8 +244,8 @@ function getTangent(p0, p1, p2, t) {
     const invT = 1.0 - t;
     const dx = 2.0 * invT * (p1.x - p0.x) + 2.0 * t * (p2.x - p1.x);
     const dy = 2.0 * invT * (p1.y - p0.y) + 2.0 * t * (p2.y - p1.y);
-    const len = Math.hypot(dx, dy);
-    if(len === 0) return {x: 1, y: 0};
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len === 0) return {x: 1, y: 0};
     return {x: dx / len, y: dy / len};
 }
 
@@ -338,6 +340,10 @@ function start() {
     const p1Array = new Float32Array(curvesDef.length * 2);
     const p2Array = new Float32Array(curvesDef.length * 2);
 
+    // Pre-allocate arrays to completely bypass Garbage Collection framing spikes
+    const currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
+    const normals = new Array(currentPoints.length).fill(null).map(() => ({x: 0, y: 0, count: 0}));
+
     function render(timeMs) {
         const time = timeMs / 1000.0;
 
@@ -354,8 +360,12 @@ function start() {
         const tension = parseFloat(tensionEl.value);
         const isBreathing = breathingEl.checked;
 
-        // Clone base points
-        let currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
+        // Reset tracking structures to base
+        for(let i=0; i<currentPoints.length; i++) {
+            currentPoints[i].x = basePoints[i].x;
+            currentPoints[i].y = basePoints[i].y;
+            normals[i].x = 0; normals[i].y = 0; normals[i].count = 0;
+        }
 
         // --- 1. TENSION MORPHING ---
         // Radically alter the structural shape based on slider
@@ -385,32 +395,31 @@ function start() {
 
         // --- 3. WEIGHT EXTRUSION (MATHEMATICAL) ---
         // We find the normal for EVERY geometric point and offset along it
-        let normals = new Array(currentPoints.length).fill(null).map(() => ({x: 0, y: 0, count: 0}));
-
+        
         // Accumulate normals from adjacent curves
-        for (let c of curvesDef) {
-            let p0 = currentPoints[c[0]];
-            let p1 = currentPoints[c[1]];
-            let p2 = currentPoints[c[2]];
+        for (const c of curvesDef) {
+            const p0 = currentPoints[c[0]];
+            const p1 = currentPoints[c[1]];
+            const p2 = currentPoints[c[2]];
             
-            let t0 = getTangent(p0, p1, p2, 0.0);
-            normals[c[0]].x += -t0.y; normals[c[0]].y += t0.x; normals[c[0]].count++;
+            const t0 = getTangent(p0, p1, p2, 0.0);
+            normals[c[0]].x -= t0.y; normals[c[0]].y += t0.x; normals[c[0]].count++;
             
             // For control points, estimate the center normal
-            let t1 = getTangent(p0, p1, p2, 0.5); 
-            normals[c[1]].x += -t1.y; normals[c[1]].y += t1.x; normals[c[1]].count++;
+            const t1 = getTangent(p0, p1, p2, 0.5); 
+            normals[c[1]].x -= t1.y; normals[c[1]].y += t1.x; normals[c[1]].count++;
             
-            let t2 = getTangent(p0, p1, p2, 1.0);
-            normals[c[2]].x += -t2.y; normals[c[2]].y += t2.x; normals[c[2]].count++;
+            const t2 = getTangent(p0, p1, p2, 1.0);
+            normals[c[2]].x -= t2.y; normals[c[2]].y += t2.x; normals[c[2]].count++;
         }
 
         // Apply weight mathematically
         if (weight !== 0.0) {
             for(let i=0; i<currentPoints.length; i++) {
                 if(normals[i].count > 0) {
-                    let nx = normals[i].x / normals[i].count;
-                    let ny = normals[i].y / normals[i].count;
-                    let len = Math.hypot(nx, ny);
+                    const nx = normals[i].x / normals[i].count;
+                    const ny = normals[i].y / normals[i].count;
+                    const len = Math.sqrt(nx * nx + ny * ny);
                     if(len > 0.0) {
                         currentPoints[i].x += (nx / len) * weight;
                         currentPoints[i].y += (ny / len) * weight;
@@ -429,9 +438,9 @@ function start() {
 
         // --- Upload to WebGL ---
         for(let i=0; i<curvesDef.length; i++) {
-            let p0 = currentPoints[curvesDef[i][0]];
-            let p1 = currentPoints[curvesDef[i][1]];
-            let p2 = currentPoints[curvesDef[i][2]];
+            const p0 = currentPoints[curvesDef[i][0]];
+            const p1 = currentPoints[curvesDef[i][1]];
+            const p2 = currentPoints[curvesDef[i][2]];
 
             p0Array[i*2] = p0.x;     p0Array[i*2+1] = p0.y;
             p1Array[i*2] = p1.x;     p1Array[i*2+1] = p1.y;
