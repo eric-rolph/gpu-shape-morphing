@@ -203,6 +203,48 @@
         input:checked + .slider:before {
             transform: translateX(20px);
         }
+        .select-modern {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.05);
+            color: white;
+            border: 1px solid var(--panel-border);
+            padding: 10px 12px;
+            border-radius: 8px;
+            outline: none;
+            cursor: pointer;
+            margin-top: 8px;
+            font-family: 'Inter', sans-serif;
+            font-size: 13px;
+        }
+
+        .select-modern option {
+            background: #18181b;
+            color: #fff;
+        }
+
+        /* Drag and Drop Zone */
+        .drop-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(99, 102, 241, 0.2);
+            backdrop-filter: blur(4px);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+            border: 4px dashed #6366f1;
+            box-sizing: border-box;
+            transition: all 0.3s ease;
+        }
+        .drop-overlay.active {
+            display: flex;
+        }
+        .drop-overlay h2 {
+            font-size: 32px;
+            font-weight: 600;
+            color: white;
+            text-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
     </style>
 </head>
 <body>
@@ -211,15 +253,23 @@
 
         <section class="controls-panel" aria-labelledby="panel-heading">
             <h1 id="panel-heading">GPU Font Engine</h1>
-            <p>Real-time vector morphing implemented purely in a WebGL fragment shader. (No textures/SDFs)</p>
+            <p>Real-time vector morphing implemented purely in a WebGL fragment shader. Drop a <b>.glif</b> file here to parse XML vectors instantly.</p>
 
             <form onsubmit="return false;">
                 <div class="control-group">
-                    <label for="weight">
-                        <span>Weight</span>
-                        <span class="value-display" id="weight-val">0.00</span>
+                    <label for="weight-x">
+                        <span>Stem Weight (X)</span>
+                        <span class="value-display" id="weight-x-val">0.00</span>
                     </label>
-                    <input type="range" id="weight" name="weight" min="-0.15" max="0.30" step="0.01" value="0.0" title="Adjust the geometric weight offset">
+                    <input type="range" id="weight-x" name="weight-x" min="-0.20" max="0.40" step="0.01" value="0.0" title="Independent horizontal stroke contrast extrusion">
+                </div>
+
+                <div class="control-group">
+                    <label for="weight-y">
+                        <span>Crossbar Weight (Y)</span>
+                        <span class="value-display" id="weight-y-val">0.00</span>
+                    </label>
+                    <input type="range" id="weight-y" name="weight-y" min="-0.20" max="0.40" step="0.01" value="0.0" title="Independent vertical stroke contrast extrusion">
                 </div>
 
                 <div class="control-group">
@@ -231,6 +281,17 @@
                 </div>
 
                 <div class="control-group">
+                    <label for="render-mode">
+                        <span>Optical Engine Mode</span>
+                    </label>
+                    <select id="render-mode" class="select-modern" name="render-mode" title="Simulate low-DPI screen bleeding or ClearType AA">
+                        <option value="0">Vector Perfect (Analytic)</option>
+                        <option value="1">Newsprint (Ink Bleed Physics)</option>
+                        <option value="2">ClearType (Subpixel RGB AA)</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
                     <label for="tension">
                         <span>Tension (Morph)</span>
                         <span class="value-display" id="tension-val">0.00</span>
@@ -238,7 +299,15 @@
                     <input type="range" id="tension" name="tension" min="0.0" max="1.0" step="0.01" value="0.0" title="Apply abstract vertex tension to morph the base shape">
                 </div>
 
-                <div class="toggle-wrapper">
+                <div class="toggle-wrapper" style="margin-top: 20px; padding-top: 16px;">
+                    <label for="show-flaws" class="toggle-label">Inspect Vector Flaws (Kinks)</label>
+                    <label class="switch">
+                        <input type="checkbox" id="show-flaws" name="show-flaws" title="Highlights mathematical tangents causing inflection overlap">
+                        <span class="slider" aria-hidden="true"></span>
+                    </label>
+                </div>
+
+                <div class="toggle-wrapper" style="margin-top: 16px; padding-top: 16px;">
                     <label for="breathing" class="toggle-label">Continuous Breathing</label>
                     <label class="switch">
                         <input type="checkbox" id="breathing" name="breathing" title="Toggle automatic subtle pulsing animation">
@@ -247,6 +316,10 @@
                 </div>
             </form>
         </section>
+        
+        <div id="drop-zone" class="drop-overlay">
+            <h2>Drop .glif (UFO Object) Here</h2>
+        </div>
     </main>
 
     <!-- The main application script -->

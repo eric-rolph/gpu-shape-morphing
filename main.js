@@ -15,13 +15,16 @@ precision highp float;
 
 // Arrays containing the points of our quadratic Bezier curves
 // Max 20 curves for this demo
-uniform vec2 u_p0[20];
-uniform vec2 u_p1[20];
-uniform vec2 u_p2[20];
+uniform vec2 u_p0[150];
+uniform vec2 u_p1[150];
+uniform vec2 u_p2[150];
 uniform int u_num_curves;
 
 uniform vec2 u_resolution;
 uniform float u_time;
+uniform int u_render_mode;
+uniform bool u_show_flaws;
+uniform float u_kink_flags[150];
 
 in vec2 v_uv;
 out vec4 fragColor;
@@ -138,6 +141,7 @@ void main() {
 
     float min_dist = 1000.0;
     int winding = 0;
+    float flaw_intensity = 0.0;
 
     // Loop through all geometric Bezier curves evaluating exact distance and winding
     for(int i = 0; i < u_num_curves; ++i) {
@@ -157,7 +161,11 @@ void main() {
             // Evaluate cubic roots for true quadratic bezier distance
             d = sdBezier(uv, p0, p1, p2);
         }
+        
         min_dist = min(min_dist, d);
+        if (u_show_flaws && u_kink_flags[i] > 0.5) {
+            flaw_intensity += smoothstep(0.04, 0.0, d);
+        }
 
         // 2. Winding Number for Inside/Outside Evaluation
         winding += calcWinding(uv, p0, p1, p2);
@@ -173,8 +181,24 @@ void main() {
     if (fw == 0.0) fw = 0.005;
 
     // Smoothstep creates our crisp perfectly anti-aliased edge.
-    // >0 is outside, <0 is inside. Alpha 1.0 when solid inside.
     float alpha = smoothstep(fw, -fw, signed_dist);
+
+    if (u_render_mode == 1) { // Ink Bleed (Physics simulation)
+        // High-frequency deterministic noise to simulate paper capillary action
+        float noise = fract(sin(dot(uv, vec2(12.9898, 78.233))) * 43758.5453);
+        float bleed = noise * 0.04;
+        alpha = smoothstep(fw + bleed, -fw - bleed, signed_dist - 0.015);
+    } 
+    else if (u_render_mode == 2) { // ClearType (RGB Subpixel Grayscale AA)
+        // Displace our exact algebraic distance field to simulate LCD triad offsets natively
+        float dR = signed_dist - dFdx(signed_dist) * 0.33;
+        float dG = signed_dist;
+        float dB = signed_dist + dFdx(signed_dist) * 0.33;
+        
+        // Output full LCD subpixel alpha array rather than a flat float
+        alpha = smoothstep(fw, -fw, dG); // Primary luminance (green essentially)
+        // Note: For true LCD this runs on a white background, approximating it generically
+    }
 
     // Aesthetics: Rich Colors and Lighting
     // Background with soft radial vignette
@@ -198,6 +222,18 @@ void main() {
     // Mix color based on our exact analytical alpha mask
     vec3 outColor = mix(bgColor, shapeColor, alpha);
 
+    // Apply subpixel bleeding if active
+    if (u_render_mode == 2) {
+        float dR = signed_dist - dFdx(signed_dist) * 0.33;
+        float dG = signed_dist;
+        float dB = signed_dist + dFdx(signed_dist) * 0.33;
+        outColor = mix(bgColor, shapeColor, vec3(
+            smoothstep(fw, -fw, dR),
+            smoothstep(fw, -fw, dG),
+            smoothstep(fw, -fw, dB)
+        ));
+    }
+
     // Modern glow: bleed light based on distance outside
     float glow = smoothstep(0.12, 0.0, max(signed_dist, 0.0));
     outColor += shapeColor * glow * 0.35;
@@ -205,6 +241,11 @@ void main() {
     // Subtle edge highlight
     float edge = smoothstep(0.02, 0.0, abs(signed_dist));
     outColor += vec3(1.0, 1.0, 1.0) * edge * 0.2 * alpha;
+    
+    // Overlay red debug kinks if inspected
+    if (flaw_intensity > 0.0) {
+        outColor = mix(outColor, vec3(1.0, 0.0, 0.2), min(flaw_intensity, 1.0));
+    }
 
     fragColor = vec4(outColor, 1.0);
 }
@@ -321,14 +362,21 @@ function start() {
     const u_num_curves_loc = gl.getUniformLocation(program, "u_num_curves");
     const u_resolution_loc = gl.getUniformLocation(program, "u_resolution");
     const u_time_loc = gl.getUniformLocation(program, "u_time");
+    const u_render_mode_loc = gl.getUniformLocation(program, "u_render_mode");
+    const u_show_flaws_loc = gl.getUniformLocation(program, "u_show_flaws");
+    const u_kink_flags_loc = gl.getUniformLocation(program, "u_kink_flags");
 
     // UI Elements
-    const weightEl = document.getElementById('weight');
+    const weightXEl = document.getElementById('weight-x');
+    const weightYEl = document.getElementById('weight-y');
     const slantEl = document.getElementById('slant');
     const tensionEl = document.getElementById('tension');
     const breathingEl = document.getElementById('breathing');
+    const renderModeEl = document.getElementById('render-mode');
+    const showFlawsEl = document.getElementById('show-flaws');
 
-    const weightValEl = document.getElementById('weight-val');
+    const weightXValEl = document.getElementById('weight-x-val');
+    const weightYValEl = document.getElementById('weight-y-val');
     const slantValEl = document.getElementById('slant-val');
     const tensionValEl = document.getElementById('tension-val');
 
@@ -338,18 +386,21 @@ function start() {
         el.addEventListener('input', updateText);
         el.addEventListener('change', updateText);
     }
-    attachSliderUpdate(weightEl, weightValEl);
+    attachSliderUpdate(weightXEl, weightXValEl);
+    attachSliderUpdate(weightYEl, weightYValEl);
     attachSliderUpdate(slantEl, slantValEl);
     attachSliderUpdate(tensionEl, tensionValEl);
 
-    // Pre-allocate WebGL arrays to avoid GC pressure in requestAnimationFrame
-    const p0Array = new Float32Array(curvesDef.length * 2);
-    const p1Array = new Float32Array(curvesDef.length * 2);
-    const p2Array = new Float32Array(curvesDef.length * 2);
+    // Maximum geometric limits setup
+    const MAX_CURVES = 150;
+    let p0Array = new Float32Array(MAX_CURVES * 2);
+    let p1Array = new Float32Array(MAX_CURVES * 2);
+    let p2Array = new Float32Array(MAX_CURVES * 2);
+    let kinksArray = new Float32Array(MAX_CURVES);
 
-    // Pre-allocate arrays to completely bypass Garbage Collection framing spikes
-    const currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
-    const normals = new Array(currentPoints.length).fill(null).map(() => ({x: 0, y: 0, count: 0}));
+    // Pre-allocate tracking arrays
+    let currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
+    let normals = new Array(currentPoints.length).fill(null).map(() => ({x: 0, y: 0, count: 0}));
 
     function render(timeMs) {
         const time = timeMs / 1000.0;
@@ -361,11 +412,20 @@ function start() {
             gl.viewport(0, 0, canvas.width, canvas.height);
         }
 
+        // Handle dynamic dataset sizing from UFO import dropzone
+        if (currentPoints.length !== basePoints.length) {
+            currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
+            normals = new Array(currentPoints.length).fill(null).map(() => ({x: 0, y: 0, count: 0}));
+        }
+
         // Fetch user inputs
-        const weight = parseFloat(weightEl.value);
+        const weightX = parseFloat(weightXEl.value);
+        const weightY = parseFloat(weightYEl.value);
         const slant = parseFloat(slantEl.value);
         const tension = parseFloat(tensionEl.value);
         const isBreathing = breathingEl.checked;
+        const renderMode = parseInt(renderModeEl.value);
+        const showFlaws = showFlawsEl.checked;
 
         // Reset tracking structures to base
         for(let i=0; i<currentPoints.length; i++) {
@@ -420,16 +480,16 @@ function start() {
             normals[c[2]].x -= t2.y; normals[c[2]].y += t2.x; normals[c[2]].count++;
         }
 
-        // Apply weight mathematically
-        if (weight !== 0.0) {
+        // Apply independent stroke weights mathematically
+        if (weightX !== 0.0 || weightY !== 0.0) {
             for(let i=0; i<currentPoints.length; i++) {
                 if(normals[i].count > 0) {
                     const nx = normals[i].x / normals[i].count;
                     const ny = normals[i].y / normals[i].count;
                     const len = Math.sqrt(nx * nx + ny * ny);
                     if(len > 0.0) {
-                        currentPoints[i].x += (nx / len) * weight;
-                        currentPoints[i].y += (ny / len) * weight;
+                        currentPoints[i].x += (nx / len) * weightX;
+                        currentPoints[i].y += (ny / len) * weightY;
                     }
                 }
             }
@@ -440,6 +500,18 @@ function start() {
         if (slant !== 0) {
             for(let i=0; i<currentPoints.length; i++) {
                 currentPoints[i].x += currentPoints[i].y * slant;
+            }
+        }
+        
+        // --- 5. DETECT MATH FLAWS ---
+        for (let i = 0; i < curvesDef.length; i++) {
+            kinksArray[i] = 0.0;
+            if (showFlaws) {
+                // Determine if tangent has a sharp inner fold
+                let dx = currentPoints[curvesDef[i][1]].x - currentPoints[curvesDef[i][0]].x;
+                let dy = currentPoints[curvesDef[i][1]].y - currentPoints[curvesDef[i][0]].y;
+                let dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist < 0.02) kinksArray[i] = 1.0;
             }
         }
 
@@ -459,7 +531,11 @@ function start() {
         gl.uniform2fv(u_p0_loc, p0Array);
         gl.uniform2fv(u_p1_loc, p1Array);
         gl.uniform2fv(u_p2_loc, p2Array);
+        gl.uniform1fv(u_kink_flags_loc, kinksArray);
+        
         gl.uniform1i(u_num_curves_loc, curvesDef.length);
+        gl.uniform1i(u_render_mode_loc, renderMode);
+        gl.uniform1i(u_show_flaws_loc, showFlaws ? 1 : 0);
         
         gl.uniform2f(u_resolution_loc, canvas.width, canvas.height);
         gl.uniform1f(u_time_loc, time);
@@ -475,9 +551,88 @@ function start() {
     requestAnimationFrame(render);
 }
 
+// Robust .glif parsing function (Unified Font Object) Integration
+function addDragAndDropSupport() {
+    const dropZone = document.getElementById('drop-zone');
+    
+    document.body.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.classList.add('active');
+    });
+
+    document.body.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        if (e.target === dropZone) dropZone.classList.remove('active');
+    });
+
+    document.body.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('active');
+        
+        const file = e.dataTransfer.files[0];
+        if (!file || !file.name.endsWith('.glif')) return alert('Please drop a valid .glif UFO file.');
+        
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const parser = new DOMParser();
+            const xml = parser.parseFromString(ev.target.result, "text/xml");
+            
+            const newPoints = [];
+            const newCurves = [];
+            let pid = 0;
+            const contours = xml.querySelectorAll("contour");
+            
+            contours.forEach(contour => {
+                const pts = Array.from(contour.querySelectorAll("point"));
+                let firstPtIdx = pid;
+                const bounds = {minX:10000, maxX:-10000, minY:10000, maxY:-10000};
+                
+                // Extremely generalized font downscaling 
+                // We'll normalize coordinates universally here
+                pts.forEach(pt => {
+                    let x = parseFloat(pt.getAttribute("x"));
+                    let y = parseFloat(pt.getAttribute("y"));
+                    bounds.minX = Math.min(bounds.minX, x);
+                    bounds.maxX = Math.max(bounds.maxX, x);
+                    bounds.minY = Math.min(bounds.minY, y);
+                    bounds.maxY = Math.max(bounds.maxY, y);
+                });
+                
+                let scale = 1.6 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+                let offsetX = -(bounds.minX + bounds.maxX) * 0.5 * scale;
+                let offsetY = -(bounds.minY + bounds.maxY) * 0.5 * scale;
+
+                for(let i=0; i<pts.length; i++) {
+                    let x = parseFloat(pts[i].getAttribute("x")) * scale + offsetX;
+                    let y = parseFloat(pts[i].getAttribute("y")) * scale + offsetY;
+                    newPoints.push({id: pid++, x: x, y: y});
+                }
+                
+                // Pair them into rough quadratics for visualization
+                for(let i=0; i<pts.length; i++) {
+                    let p0 = firstPtIdx + i;
+                    let p1 = firstPtIdx + ((i+1) % pts.length);
+                    let p2 = firstPtIdx + ((i+2) % pts.length);
+                    newCurves.push([p0, p1, p2]);
+                }
+            });
+
+            if (newCurves.length > 0 && newCurves.length < 150) {
+                basePoints.length = 0; basePoints.push(...newPoints);
+                curvesDef.length = 0; curvesDef.push(...newCurves);
+            } else {
+                alert("File contains too many curves for standalone browser prototype (" + newCurves.length + "/150 max).");
+            }
+        };
+        reader.readAsText(file);
+    });
+}
+
+
 // Start application
 window.onload = () => {
     start();
+    addDragAndDropSupport();
     // UX Research: Add keyboard shortcut to hide UI
     window.addEventListener('keydown', (e) => {
         if (e.key.toLowerCase() === 'h') {
