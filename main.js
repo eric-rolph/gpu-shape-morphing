@@ -181,6 +181,13 @@ void main() {
     float vFactor = length(uv) * 0.25;
     vec3 bgColor = vec3(0.08, 0.08, 0.12) - vFactor;
 
+    // Technical Artist Feature: Smooth mathematical grid lines
+    vec2 grid_uv = uv * 5.0;
+    vec2 grid = abs(fract(grid_uv - 0.5) - 0.5) / max(fwidth(grid_uv), 0.001);
+    float gridLine = min(grid.x, grid.y);
+    float gridAlpha = 1.0 - min(gridLine, 1.0);
+    bgColor += vec3(0.2, 0.2, 0.5) * gridAlpha * 0.15;
+
     // Geometric gradient on the shape itself
     vec3 shapeColor = vec3(
         0.5 + 0.5 * sin(uv.x * 2.0 + u_time * 0.5), 
@@ -469,4 +476,15 @@ function start() {
 }
 
 // Start application
-window.onload = start;
+window.onload = () => {
+    start();
+    // UX Research: Add keyboard shortcut to hide UI
+    window.addEventListener('keydown', (e) => {
+        if (e.key.toLowerCase() === 'h') {
+            const panel = document.querySelector('.controls-panel');
+            if (panel) {
+                panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+            }
+        }
+    });
+};
