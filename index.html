@@ -299,14 +299,23 @@
 
         <section class="controls-panel" aria-labelledby="panel-heading">
             <h1 id="panel-heading">GPU Font Engine</h1>
-            <p style="margin-bottom: 16px;">Real-time vector morphing implemented purely in a WebGL fragment shader. Drop a <b>.glif</b> or <b>.ttf/.otf</b> file here to parse XML vectors instantly. Scroll to Zoom, Drag to Pan!</p>
+            <p style="margin-bottom: 16px;">Real-time vector morphing implemented purely in a WebGL fragment shader. Drag <b>Glyph Morph</b> to interpolate between two glyph masters. Drop a <b>.glif</b> or <b>.ttf/.otf</b> file to load real outlines. Scroll to Zoom, Drag to Pan!</p>
 
             <form onsubmit="return false;">
                 <div class="control-group" id="live-text-container" style="display: none;">
                     <label for="live-text">
-                        <span>Preview Text</span>
+                        <span>Glyph Masters (Source / Target)</span>
                     </label>
-                    <input type="text" id="live-text" class="input-modern" value="A" maxlength="6" title="Type characters to morph live!">
+                    <input type="text" id="live-text" class="input-modern" value="A" maxlength="6" title="Source glyph master — type characters to morph live!">
+                    <input type="text" id="morph-target" class="input-modern" value="B" maxlength="6" title="Target glyph master for the Glyph Morph slider">
+                </div>
+
+                <div class="control-group">
+                    <label for="glyph-blend">
+                        <span>Glyph Morph (A &#8646; B)</span>
+                        <span class="value-display" id="glyph-blend-val">0.00</span>
+                    </label>
+                    <input type="range" id="glyph-blend" name="glyph-blend" min="0" max="1" step="0.01" value="0" title="Interpolate between the source and target glyph masters">
                 </div>
 
                 <div class="control-group">

@@ -314,8 +314,230 @@ const curvesDef = [
 // texture size in WebGL2 is 2048) and by per-pixel loop cost in the shader.
 const MAX_CURVES = 1024;
 
-// The morphed (post weight/slant/tension) points, refreshed every frame by the
-// render loop. Module-scoped so the export builders see live geometry.
+// ---------- Glyph Interpolation Engine (master blending) ----------
+// Builds a 1:1 curve correspondence between two arbitrary glyph outlines so the
+// render loop can lerp control points. Curve counts are equalized with exact
+// de Casteljau subdivision, so both masters render with zero shape error at
+// blend 0 and 1 — the interpolation is between true outlines, not resamplings.
+
+// Split flat indexed geometry into closed contours of {p0,p1,p2} curve records.
+// A contour break is any positional discontinuity between one curve's end and
+// the next curve's start.
+function splitContours(geom) {
+    const out = [];
+    let current = null;
+    for (let i = 0; i < geom.curves.length; i++) {
+        const [a, b, c] = geom.curves[i];
+        const p0 = geom.points[a], p1 = geom.points[b], p2 = geom.points[c];
+        const prev = i > 0 ? geom.points[geom.curves[i-1][2]] : null;
+        if (!prev || Math.abs(prev.x - p0.x) > 1e-6 || Math.abs(prev.y - p0.y) > 1e-6) {
+            current = [];
+            out.push(current);
+        }
+        current.push({p0: {x: p0.x, y: p0.y}, p1: {x: p1.x, y: p1.y}, p2: {x: p2.x, y: p2.y}});
+    }
+    return out;
+}
+
+function sampleQuad(c, t) {
+    const it = 1 - t;
+    return {
+        x: it*it*c.p0.x + 2.0*t*it*c.p1.x + t*t*c.p2.x,
+        y: it*it*c.p0.y + 2.0*t*it*c.p1.y + t*t*c.p2.y
+    };
+}
+
+function contourSignedArea(contour) {
+    // Shoelace over a sampled polyline — 4 samples per curve is plenty for
+    // size ranking and orientation.
+    const samples = [];
+    contour.forEach(c => { for (let k = 0; k < 4; k++) samples.push(sampleQuad(c, k / 4)); });
+    let area = 0;
+    for (let i = 0; i < samples.length; i++) {
+        const a = samples[i], b = samples[(i + 1) % samples.length];
+        area += a.x * b.y - b.x * a.y;
+    }
+    return area / 2;
+}
+
+function contourCentroid(contour) {
+    let sx = 0, sy = 0, n = 0;
+    contour.forEach(c => { for (let k = 0; k < 4; k++) { const s = sampleQuad(c, k / 4); sx += s.x; sy += s.y; n++; } });
+    return {x: sx / n, y: sy / n};
+}
+
+function curvePolyLength(c) {
+    return Math.hypot(c.p1.x - c.p0.x, c.p1.y - c.p0.y) + Math.hypot(c.p2.x - c.p1.x, c.p2.y - c.p1.y);
+}
+
+// Exact split of one quadratic into two at t=0.5 (de Casteljau): the union of
+// the halves traces the identical locus, so subdivision never distorts a master.
+function splitQuad(c) {
+    const m01 = {x: (c.p0.x + c.p1.x) / 2, y: (c.p0.y + c.p1.y) / 2};
+    const m12 = {x: (c.p1.x + c.p2.x) / 2, y: (c.p1.y + c.p2.y) / 2};
+    const mid = {x: (m01.x + m12.x) / 2, y: (m01.y + m12.y) / 2};
+    return [
+        {p0: {x: c.p0.x, y: c.p0.y}, p1: m01, p2: {x: mid.x, y: mid.y}},
+        {p0: {x: mid.x, y: mid.y}, p1: m12, p2: {x: c.p2.x, y: c.p2.y}}
+    ];
+}
+
+function subdivideToCount(contour, N) {
+    const out = contour.map(c => ({p0: {...c.p0}, p1: {...c.p1}, p2: {...c.p2}}));
+    while (out.length < N) {
+        let longest = -1, li = 0;
+        for (let i = 0; i < out.length; i++) {
+            const l = curvePolyLength(out[i]);
+            if (l > longest) { longest = l; li = i; }
+        }
+        out.splice(li, 1, ...splitQuad(out[li]));
+    }
+    return out;
+}
+
+function reverseContour(contour) {
+    return contour.slice().reverse().map(c => ({p0: {...c.p2}, p1: {...c.p1}, p2: {...c.p0}}));
+}
+
+// Cyclic phase alignment: rotate ring b so its curve start points sit closest
+// to a's, preventing twisting morphs.
+function bestRingRotation(a, b) {
+    const N = a.length;
+    let best = 0, bestCost = Infinity;
+    for (let k = 0; k < N; k++) {
+        let cost = 0;
+        for (let i = 0; i < N; i++) {
+            const pa = a[i].p0, pb = b[(i + k) % N].p0;
+            const dx = pa.x - pb.x, dy = pa.y - pb.y;
+            cost += dx * dx + dy * dy;
+            if (cost >= bestCost) break;
+        }
+        if (cost < bestCost) { bestCost = cost; best = k; }
+    }
+    return b.slice(best).concat(b.slice(0, best));
+}
+
+function degenerateContour(center, N) {
+    const out = [];
+    for (let i = 0; i < N; i++) {
+        out.push({p0: {...center}, p1: {...center}, p2: {...center}});
+    }
+    return out;
+}
+
+// Pair two contour sets: largest against largest (outers match outers, counters
+// match counters), pad count mismatches with point-contours so extra holes grow
+// from / collapse to their partner's centroid, then equalize curve counts and
+// align orientation + ring phase per pair.
+function pairContourSets(contoursA, contoursB) {
+    const byArea = list => list
+        .map(c => ({c, a: Math.abs(contourSignedArea(c))}))
+        .sort((u, v) => v.a - u.a)
+        .map(o => o.c);
+    const A = byArea(contoursA);
+    let B = byArea(contoursB);
+
+    // Normalize orientation ONCE per shape, keyed off the dominant contours.
+    // Flipping per pair would break B's internal outer/counter winding
+    // relationship whenever a pair involves a zero-area degenerate (the
+    // counter would stop canceling its outer and render filled).
+    if (A.length && B.length && contourSignedArea(A[0]) * contourSignedArea(B[0]) < -1e-12) {
+        B = B.map(reverseContour);
+    }
+
+    const n = Math.max(A.length, B.length);
+    const outA = [], outB = [];
+    for (let i = 0; i < n; i++) {
+        let a = A[i], b = B[i];
+        if (!a) a = degenerateContour(contourCentroid(b), b.length);
+        if (!b) b = degenerateContour(contourCentroid(a), a.length);
+        const N = Math.max(a.length, b.length);
+        a = subdivideToCount(a, N);
+        b = subdivideToCount(b, N);
+        b = bestRingRotation(a, b);
+        outA.push(a);
+        outB.push(b);
+    }
+    return {src: outA, dst: outB};
+}
+
+// Flatten contours back to indexed geometry. Join points within a ring share an
+// index (and rings close back onto their start index) so the per-point normal
+// accumulation keeps weight extrusion continuous across curve joins.
+function flattenContours(contours) {
+    const points = [], curves = [];
+    contours.forEach(contour => {
+        if (contour.length === 0) return;
+        const startIdx = points.length;
+        let lastIdx = -1;
+        for (let i = 0; i < contour.length; i++) {
+            const c = contour[i];
+            const i0 = (i === 0) ? (points.push({id: points.length, x: c.p0.x, y: c.p0.y}) - 1) : lastIdx;
+            const i1 = points.push({id: points.length, x: c.p1.x, y: c.p1.y}) - 1;
+            const i2 = (i === contour.length - 1)
+                ? startIdx
+                : (points.push({id: points.length, x: c.p2.x, y: c.p2.y}) - 1);
+            curves.push([i0, i1, i2]);
+            lastIdx = i2;
+        }
+    });
+    return {points, curves};
+}
+
+// Built-in morph target: a stylized "O" (outer ring clockwise, counter ring
+// counter-clockwise — matching the built-in A's winding) from quadratic arcs.
+function makeBuiltinTargetGeometry() {
+    const points = [], curves = [];
+    const ring = (r, n, clockwise) => {
+        const start = points.length;
+        const ctrlR = r / Math.cos(Math.PI / n);
+        const dir = clockwise ? -1 : 1;
+        for (let i = 0; i < n; i++) {
+            const a0 = Math.PI / 2 + dir * (i / n) * Math.PI * 2;
+            const ac = Math.PI / 2 + dir * ((i + 0.5) / n) * Math.PI * 2;
+            points.push({id: points.length, x: Math.cos(a0) * r, y: Math.sin(a0) * r});
+            points.push({id: points.length, x: Math.cos(ac) * ctrlR, y: Math.sin(ac) * ctrlR});
+        }
+        for (let i = 0; i < n; i++) {
+            curves.push([start + i * 2, start + i * 2 + 1, start + ((i + 1) % n) * 2]);
+        }
+    };
+    ring(0.8, 8, true);    // outer shell
+    ring(0.45, 6, false);  // inner counter
+    return {points, curves};
+}
+
+// Source/target masters as raw geometry; rebuildMorph() compiles them into the
+// shared-topology basePoints/curvesDef + aligned morphTargetPoints.
+let morphSourceGeom = {points: basePoints.map(p => ({x: p.x, y: p.y})), curves: curvesDef.map(c => [...c])};
+let morphTargetGeom = makeBuiltinTargetGeometry();
+let morphTargetPoints = null;
+
+function rebuildMorph() {
+    if (!morphSourceGeom) return;
+    const src = splitContours(morphSourceGeom);
+    let flatSrc, flatDst = null;
+    if (morphTargetGeom) {
+        const paired = pairContourSets(src, splitContours(morphTargetGeom));
+        const total = paired.src.reduce((s, c) => s + c.length, 0);
+        if (total > MAX_CURVES) {
+            alert(`Morph pair too complex (${total} curves, max ${MAX_CURVES}). Keeping previous shapes.`);
+            return;
+        }
+        flatSrc = flattenContours(paired.src);
+        flatDst = flattenContours(paired.dst);
+    } else {
+        flatSrc = flattenContours(src);
+    }
+    basePoints.length = 0; basePoints.push(...flatSrc.points);
+    curvesDef.length = 0; curvesDef.push(...flatSrc.curves);
+    morphTargetPoints = flatDst ? flatDst.points : null;
+}
+
+rebuildMorph();
+
+// The morphed (post blend/weight/slant/tension) points, refreshed every frame by
+// the render loop. Module-scoped so the export builders see live geometry.
 let currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
 
 // Utility: get mathematical tangent of a bezier curve at T
@@ -419,6 +641,7 @@ function start() {
     const weightYEl = document.getElementById('weight-y');
     const slantEl = document.getElementById('slant');
     const tensionEl = document.getElementById('tension');
+    const glyphBlendEl = document.getElementById('glyph-blend');
     const breathingEl = document.getElementById('breathing');
     const renderModeEl = document.getElementById('render-mode');
     const showFlawsEl = document.getElementById('show-flaws');
@@ -438,6 +661,7 @@ function start() {
     attachSliderUpdate(weightYEl, weightYValEl);
     attachSliderUpdate(slantEl, slantValEl);
     attachSliderUpdate(tensionEl, tensionValEl);
+    attachSliderUpdate(glyphBlendEl, document.getElementById('glyph-blend-val'));
 
     // Per-frame upload scratch: two RGBA32F rows of up to MAX_CURVES texels each
     const curveTexData = new Float32Array(MAX_CURVES * 8);
@@ -519,6 +743,7 @@ function start() {
         const weightY = parseFloat(weightYEl.value);
         const slant = parseFloat(slantEl.value);
         const tension = parseFloat(tensionEl.value);
+        const glyphBlend = parseFloat(glyphBlendEl.value);
         const isBreathing = breathingEl.checked;
         const renderMode = parseInt(renderModeEl.value);
         const showFlaws = showFlawsEl.checked;
@@ -528,6 +753,16 @@ function start() {
             currentPoints[i].x = basePoints[i].x;
             currentPoints[i].y = basePoints[i].y;
             normals[i].x = 0; normals[i].y = 0; normals[i].count = 0;
+        }
+
+        // --- 0. GLYPH INTERPOLATION (master blend) ---
+        // basePoints/morphTargetPoints share topology (built by rebuildMorph), so
+        // a straight control-point lerp interpolates the two exact outlines.
+        if (glyphBlend > 0 && morphTargetPoints && morphTargetPoints.length === currentPoints.length) {
+            for(let i=0; i<currentPoints.length; i++) {
+                currentPoints[i].x += (morphTargetPoints[i].x - currentPoints[i].x) * glyphBlend;
+                currentPoints[i].y += (morphTargetPoints[i].y - currentPoints[i].y) * glyphBlend;
+            }
         }
 
         // --- 1. TENSION MORPHING ---
@@ -706,15 +941,18 @@ function start() {
 // Global cache for opentype font object
 let activeFont = null;
 
-// Convert opentype.js paths into geometric curves
-function updateFontPreview(text) {
-    if (!activeFont || !text) return;
+// Convert an opentype.js path for `text` into flat normalized geometry.
+// Pure: returns {points, curves} (or null) without touching the live shape, so
+// the same extraction serves both the morph source and the morph target.
+function extractFontGeometry(text) {
+    if (!activeFont || !text) return null;
 
     const path = activeFont.getPath(text, 0, 0, 1000);
     const newPoints = [];
     const newCurves = [];
 
     let currentX = 0, currentY = 0;
+    let startX = 0, startY = 0;
 
     // Bounds tracking — include control points (x1/y1, x2/y2) so wide curve
     // handles can't push geometry outside the normalized viewport.
@@ -731,7 +969,7 @@ function updateFontPreview(text) {
         track(cmd.x1, cmd.y1);
         track(cmd.x2, cmd.y2);
     });
-    if (!isFinite(bounds.minX)) return; // nothing drawable (e.g. whitespace only)
+    if (!isFinite(bounds.minX)) return null; // nothing drawable (e.g. whitespace only)
 
     let scale = 1.6 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 1e-6);
     let offsetX = -(bounds.minX + bounds.maxX) * 0.5 * scale;
@@ -741,7 +979,7 @@ function updateFontPreview(text) {
         let scP0 = {x: p0x * scale + offsetX, y: -(p0y * scale + offsetY)};
         let scP1 = {x: p1x * scale + offsetX, y: -(p1y * scale + offsetY)};
         let scP2 = {x: p2x * scale + offsetX, y: -(p2y * scale + offsetY)};
-        
+
         const idx = newPoints.length;
         newPoints.push({id: idx, x: scP0.x, y: scP0.y});
         newPoints.push({id: idx+1, x: scP1.x, y: scP1.y});
@@ -750,7 +988,7 @@ function updateFontPreview(text) {
     };
 
     path.commands.forEach(cmd => {
-        if (cmd.type === 'M') { currentX = cmd.x; currentY = cmd.y; }
+        if (cmd.type === 'M') { currentX = cmd.x; currentY = cmd.y; startX = cmd.x; startY = cmd.y; }
         else if (cmd.type === 'L') {
             // Convert line to exact quadratic
             let cx = (currentX + cmd.x)/2; let cy = (currentY + cmd.y)/2;
@@ -762,21 +1000,101 @@ function updateFontPreview(text) {
             currentX = cmd.x; currentY = cmd.y;
         }
         else if (cmd.type === 'C') {
-            // Rough cubic -> quad approximation (midpoint of controls)
-            let cx = (cmd.x1 + cmd.x2)/2; let cy = (cmd.y1 + cmd.y2)/2;
-            addCurve(currentX, currentY, cx, cy, cmd.x, cmd.y);
+            // Cubic -> two quadratics: split at t=0.5 (de Casteljau), then fit
+            // each half with the standard 3/4-rule control point. Far closer to
+            // CFF outlines than a single midpoint quad.
+            const x01 = (currentX + cmd.x1)/2,  y01 = (currentY + cmd.y1)/2;
+            const x12 = (cmd.x1 + cmd.x2)/2,    y12 = (cmd.y1 + cmd.y2)/2;
+            const x23 = (cmd.x2 + cmd.x)/2,     y23 = (cmd.y2 + cmd.y)/2;
+            const x012 = (x01 + x12)/2,         y012 = (y01 + y12)/2;
+            const x123 = (x12 + x23)/2,         y123 = (y12 + y23)/2;
+            const mx = (x012 + x123)/2,         my = (y012 + y123)/2;
+            // Quad control for cubic (P0,C1,C2,P3) ~ (3(C1+C2) - P0 - P3) / 4
+            const q1x = (3*(x01 + x012) - currentX - mx)/4, q1y = (3*(y01 + y012) - currentY - my)/4;
+            const q2x = (3*(x123 + x23) - mx - cmd.x)/4,    q2y = (3*(y123 + y23) - my - cmd.y)/4;
+            addCurve(currentX, currentY, q1x, q1y, mx, my);
+            addCurve(mx, my, q2x, q2y, cmd.x, cmd.y);
             currentX = cmd.x; currentY = cmd.y;
         }
-        else if (cmd.type === 'Z') { /* Path closed */ }
+        else if (cmd.type === 'Z') {
+            // Close the contour explicitly so chains form closed rings
+            if (Math.abs(currentX - startX) > 1e-6 || Math.abs(currentY - startY) > 1e-6) {
+                const cx = (currentX + startX)/2, cy = (currentY + startY)/2;
+                addCurve(currentX, currentY, cx, cy, startX, startY);
+            }
+            currentX = startX; currentY = startY;
+        }
     });
 
-    if (newCurves.length === 0) return; // keep the current shape rather than alerting
-    if (newCurves.length > MAX_CURVES) {
-        alert(`String too complex. Contains ${newCurves.length} geometric curves (Max ${MAX_CURVES}). Try fewer characters.`);
+    if (newCurves.length === 0) return null;
+    return {points: newPoints, curves: newCurves};
+}
+
+function updateFontPreview(text) {
+    const geom = extractFontGeometry(text);
+    if (!geom) return; // keep the current shape rather than alerting
+    if (geom.curves.length > MAX_CURVES) {
+        alert(`String too complex. Contains ${geom.curves.length} geometric curves (Max ${MAX_CURVES}). Try fewer characters.`);
         return;
     }
-    basePoints.length = 0; basePoints.push(...newPoints);
-    curvesDef.length = 0; curvesDef.push(...newCurves);
+    morphSourceGeom = geom;
+    rebuildMorph();
+}
+
+function updateMorphTarget(text) {
+    const geom = extractFontGeometry(text);
+    if (!geom) return;
+    if (geom.curves.length > MAX_CURVES) {
+        alert(`Morph target too complex. Contains ${geom.curves.length} geometric curves (Max ${MAX_CURVES}).`);
+        return;
+    }
+    morphTargetGeom = geom;
+    rebuildMorph();
+}
+
+// Decode one UFO .glif contour (points with on/off-curve types) into a closed
+// chain of quadratics. Runs of consecutive off-curve points get TrueType-style
+// implied on-curve midpoints. This honors the actual outline semantics, so
+// glyphs exported from this app (or any UFO editor) round-trip correctly.
+function glifContourToQuads(pts) {
+    if (pts.length < 2) return [];
+
+    // Insert implied on-curve midpoints between consecutive off-curves
+    const expanded = [];
+    for (let i = 0; i < pts.length; i++) {
+        const cur = pts[i], next = pts[(i + 1) % pts.length];
+        expanded.push(cur);
+        if (!cur.on && !next.on) {
+            expanded.push({x: (cur.x + next.x) / 2, y: (cur.y + next.y) / 2, on: true});
+        }
+    }
+
+    // Rotate so the ring starts on an on-curve point
+    const firstOn = expanded.findIndex(p => p.on);
+    if (firstOn === -1) return [];
+    const ring = expanded.slice(firstOn).concat(expanded.slice(0, firstOn));
+
+    // Walk: on-curve -> on-curve is a straight segment (degenerate quad);
+    // on-curve -> off-curve -> on-curve is one quadratic.
+    const quads = [];
+    let i = 0;
+    while (i < ring.length) {
+        const p0 = ring[i];
+        const p1 = ring[(i + 1) % ring.length];
+        if (p1.on) {
+            quads.push({
+                p0: {x: p0.x, y: p0.y},
+                p1: {x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2},
+                p2: {x: p1.x, y: p1.y}
+            });
+            i += 1;
+        } else {
+            const p2 = ring[(i + 2) % ring.length];
+            quads.push({p0: {x: p0.x, y: p0.y}, p1: {x: p1.x, y: p1.y}, p2: {x: p2.x, y: p2.y}});
+            i += 2;
+        }
+    }
+    return quads;
 }
 
 // Robust parsing function Integration
@@ -784,9 +1102,13 @@ function addDragAndDropSupport() {
     const dropZone = document.getElementById('drop-zone');
     const liveTextUI = document.getElementById('live-text-container');
     const liveTextInput = document.getElementById('live-text');
-    
+    const morphTargetInput = document.getElementById('morph-target');
+
     liveTextInput.addEventListener('input', (e) => {
         updateFontPreview(e.target.value || " ");
+    });
+    morphTargetInput.addEventListener('input', (e) => {
+        updateMorphTarget(e.target.value || " ");
     });
     
     document.body.addEventListener('dragover', (e) => {
@@ -819,6 +1141,7 @@ function addDragAndDropSupport() {
                     activeFont = opentype.parse(ev.target.result);
                     liveTextUI.style.display = 'block';
                     updateFontPreview(liveTextInput.value);
+                    updateMorphTarget(morphTargetInput.value);
                 } catch (err) {
                     alert('Could not parse OpenType font format.');
                     console.error(err);
@@ -843,7 +1166,6 @@ function addDragAndDropSupport() {
 
             const newPoints = [];
             const newCurves = [];
-            let pid = 0;
             const contours = Array.from(xml.querySelectorAll("contour"));
 
             // Normalize against the bounds of the WHOLE glyph, not per contour —
@@ -869,30 +1191,31 @@ function addDragAndDropSupport() {
             const offsetY = -(bounds.minY + bounds.maxY) * 0.5 * scale;
 
             contours.forEach(contour => {
-                const pts = Array.from(contour.querySelectorAll("point"));
-                let firstPtIdx = pid;
+                // UFO semantics: off-curve points have no type attribute (or
+                // type="offcurve"); everything else (qcurve/curve/line/move) is on-curve.
+                const pts = Array.from(contour.querySelectorAll("point")).map(pt => ({
+                    x: parseFloat(pt.getAttribute("x")) * scale + offsetX,
+                    y: parseFloat(pt.getAttribute("y")) * scale + offsetY,
+                    on: pt.getAttribute("type") !== null && pt.getAttribute("type") !== "offcurve"
+                })).filter(p => !isNaN(p.x) && !isNaN(p.y));
 
-                for(let i=0; i<pts.length; i++) {
-                    let x = parseFloat(pts[i].getAttribute("x")) * scale + offsetX;
-                    let y = parseFloat(pts[i].getAttribute("y")) * scale + offsetY;
-                    newPoints.push({id: pid++, x: x, y: y});
-                }
-
-                // Pair them into rough quadratics for visualization
-                for(let i=0; i<pts.length; i++) {
-                    let p0 = firstPtIdx + i;
-                    let p1 = firstPtIdx + ((i+1) % pts.length);
-                    let p2 = firstPtIdx + ((i+2) % pts.length);
-                    newCurves.push([p0, p1, p2]);
-                }
+                glifContourToQuads(pts).forEach(q => {
+                    const idx = newPoints.length;
+                    newPoints.push({id: idx,   x: q.p0.x, y: q.p0.y});
+                    newPoints.push({id: idx+1, x: q.p1.x, y: q.p1.y});
+                    newPoints.push({id: idx+2, x: q.p2.x, y: q.p2.y});
+                    newCurves.push([idx, idx+1, idx+2]);
+                });
             });
 
-            if (newCurves.length > 0 && newCurves.length <= MAX_CURVES) {
-                basePoints.length = 0; basePoints.push(...newPoints);
-                curvesDef.length = 0; curvesDef.push(...newCurves);
-            } else {
-                alert("File contains too many curves for standalone browser prototype (" + newCurves.length + "/" + MAX_CURVES + " max).");
+            if (newCurves.length === 0) {
+                return alert('No drawable contours found in this .glif file.');
             }
+            if (newCurves.length > MAX_CURVES) {
+                return alert("File contains too many curves for standalone browser prototype (" + newCurves.length + "/" + MAX_CURVES + " max).");
+            }
+            morphSourceGeom = {points: newPoints, curves: newCurves};
+            rebuildMorph();
         };
         reader.readAsText(file);
     });
