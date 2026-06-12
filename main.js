@@ -13,17 +13,16 @@ void main() {
 const fragmentShaderSource = `#version 300 es
 precision highp float;
 
-// Arrays containing the points of our quadratic Bezier curves
-uniform vec2 u_p0[350];
-uniform vec2 u_p1[350];
-uniform vec2 u_p2[350];
+// Curve data texture: texel (i, 0) = [p0.xy, p1.xy], texel (i, 1) = [p2.xy, kinkFlag, unused]
+// A texture sidesteps fragment uniform limits (the old vec2[350] arrays needed ~1400
+// vec4 slots — over the 1024 cap on many mobile/Apple GPUs) and scales to 1024+ curves.
+uniform highp sampler2D u_curves;
 uniform int u_num_curves;
 
 uniform vec2 u_resolution;
 uniform float u_time;
 uniform int u_render_mode;
 uniform bool u_show_flaws;
-uniform float u_kink_flags[350];
 
 uniform vec2 u_offset;
 uniform float u_zoom;
@@ -150,30 +149,47 @@ void main() {
 
     // Loop through all geometric Bezier curves evaluating exact distance and winding
     for(int i = 0; i < u_num_curves; ++i) {
-        vec2 p0 = u_p0[i];
-        vec2 p1 = u_p1[i];
-        vec2 p2 = u_p2[i];
+        vec4 c0 = texelFetch(u_curves, ivec2(i, 0), 0);
+        vec4 c1 = texelFetch(u_curves, ivec2(i, 1), 0);
+        vec2 p0 = c0.xy;
+        vec2 p1 = c0.zw;
+        vec2 p2 = c1.xy;
+        float kink = c1.z;
 
-        // 1. Distance for Anti-aliasing
-        float d;
-        vec2 b_vec = p0 - 2.0*p1 + p2;
-        if (dot(b_vec, b_vec) < 1e-6) {
-            // It's a linear segment, fallback to precise line segment distance
-            vec2 pa = uv - p0, ba = p2 - p0;
-            float h = clamp( dot(pa,ba)/max(dot(ba,ba), 1e-8), 0.0, 1.0 );
-            d = length( pa - ba*h );
-        } else {
-            // Evaluate cubic roots for true quadratic bezier distance
-            d = sdBezier(uv, p0, p1, p2);
-        }
-        
-        min_dist = min(min_dist, d);
-        if (u_show_flaws && u_kink_flags[i] > 0.5) {
-            flaw_intensity += smoothstep(0.04, 0.0, d);
+        // The curve lies inside the convex hull of its control points, so this
+        // box bounds both the true distance and any possible ray intersections.
+        vec2 bmin = min(p0, min(p1, p2));
+        vec2 bmax = max(p0, max(p1, p2));
+
+        // 1. Distance for Anti-aliasing. The box distance is a lower bound on the
+        // true distance, so curves that provably cannot lower the running minimum
+        // (or feed the kink glow) skip the expensive cubic root solve entirely.
+        vec2 gap = max(max(bmin - uv, uv - bmax), vec2(0.0));
+        float boxDist = length(gap);
+        float threshold = (u_show_flaws && kink > 0.5) ? max(min_dist, 0.05) : min_dist;
+        if (boxDist < threshold) {
+            float d;
+            vec2 b_vec = p0 - 2.0*p1 + p2;
+            if (dot(b_vec, b_vec) < 1e-6) {
+                // It's a linear segment, fallback to precise line segment distance
+                vec2 pa = uv - p0, ba = p2 - p0;
+                float h = clamp( dot(pa,ba)/max(dot(ba,ba), 1e-8), 0.0, 1.0 );
+                d = length( pa - ba*h );
+            } else {
+                // Evaluate cubic roots for true quadratic bezier distance
+                d = sdBezier(uv, p0, p1, p2);
+            }
+
+            min_dist = min(min_dist, d);
+            if (u_show_flaws && kink > 0.5) {
+                flaw_intensity += smoothstep(0.04, 0.0, d);
+            }
         }
 
-        // 2. Winding Number for Inside/Outside Evaluation
-        winding += calcWinding(uv, p0, p1, p2);
+        // 2. Winding Number — only curves whose hull straddles the +x ray can contribute
+        if (uv.y >= bmin.y && uv.y <= bmax.y && uv.x < bmax.x) {
+            winding += calcWinding(uv, p0, p1, p2);
+        }
     }
 
     // Inside features Winding != 0, assign a negative distance
@@ -193,17 +209,9 @@ void main() {
         float noise = fract(sin(dot(uv, vec2(12.9898, 78.233))) * 43758.5453);
         float bleed = noise * 0.04;
         alpha = smoothstep(fw + bleed, -fw - bleed, signed_dist - 0.015);
-    } 
-    else if (u_render_mode == 2) { // ClearType (RGB Subpixel Grayscale AA)
-        // Displace our exact algebraic distance field to simulate LCD triad offsets natively
-        float dR = signed_dist - dFdx(signed_dist) * 0.33;
-        float dG = signed_dist;
-        float dB = signed_dist + dFdx(signed_dist) * 0.33;
-        
-        // Output full LCD subpixel alpha array rather than a flat float
-        alpha = smoothstep(fw, -fw, dG); // Primary luminance (green essentially)
-        // Note: For true LCD this runs on a white background, approximating it generically
     }
+    // ClearType (mode 2) is handled below as a per-channel mix; the base alpha
+    // already equals its green-channel coverage.
 
     // Aesthetics: Rich Colors and Lighting
     // Background with soft radial vignette
@@ -297,10 +305,18 @@ const basePoints = [
 
 // Connectivity definition: Which points form the Bezier curves [P0, P1, P2]
 const curvesDef = [
-    [0, 1, 2], [2, 3, 4], [4, 5, 6], [6, 7, 8], 
-    [8, 9, 10], [10, 11, 12], [12, 13, 0],   
-    [14, 15, 16], [16, 17, 18], [18, 19, 14] 
+    [0, 1, 2], [2, 3, 4], [4, 5, 6], [6, 7, 8],
+    [8, 9, 10], [10, 11, 12], [12, 13, 0],
+    [14, 15, 16], [16, 17, 18], [18, 19, 14]
 ];
+
+// Hard cap on curve count — bounded by the data texture width (min guaranteed
+// texture size in WebGL2 is 2048) and by per-pixel loop cost in the shader.
+const MAX_CURVES = 1024;
+
+// The morphed (post weight/slant/tension) points, refreshed every frame by the
+// render loop. Module-scoped so the export builders see live geometry.
+let currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
 
 // Utility: get mathematical tangent of a bezier curve at T
 function getTangent(p0, p1, p2, t) {
@@ -315,10 +331,15 @@ function getTangent(p0, p1, p2, t) {
 
 function initWebGL() {
     const canvas = document.getElementById('webgl-canvas');
-    const gl = canvas.getContext('webgl2');
-    
+    // preserveDrawingBuffer keeps the back buffer readable after compositing so the
+    // PNG/SDF export's toDataURL() doesn't capture a cleared (blank) frame.
+    const gl = canvas.getContext('webgl2', { preserveDrawingBuffer: true });
+
     if (!gl) {
         console.error("WebGL 2.0 not supported!");
+        document.body.insertAdjacentHTML('beforeend',
+            '<div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#f4f4f5;font-family:Inter,sans-serif;text-align:center;padding:24px;">' +
+            '<p>This demo requires WebGL 2.0, which your browser or GPU does not support.</p></div>');
         return null;
     }
 
@@ -371,18 +392,27 @@ function start() {
     const { gl, program, canvas } = context;
 
     // Get Uniform Locations
-    const u_p0_loc = gl.getUniformLocation(program, "u_p0");
-    const u_p1_loc = gl.getUniformLocation(program, "u_p1");
-    const u_p2_loc = gl.getUniformLocation(program, "u_p2");
+    const u_curves_loc = gl.getUniformLocation(program, "u_curves");
     const u_num_curves_loc = gl.getUniformLocation(program, "u_num_curves");
     const u_resolution_loc = gl.getUniformLocation(program, "u_resolution");
     const u_time_loc = gl.getUniformLocation(program, "u_time");
     const u_render_mode_loc = gl.getUniformLocation(program, "u_render_mode");
     const u_show_flaws_loc = gl.getUniformLocation(program, "u_show_flaws");
-    const u_kink_flags_loc = gl.getUniformLocation(program, "u_kink_flags");
-    
+
     const u_offset_loc = gl.getUniformLocation(program, "u_offset");
     const u_zoom_loc = gl.getUniformLocation(program, "u_zoom");
+
+    // Curve data texture: column i holds one curve, row 0 = [p0, p1], row 1 = [p2, kink, 0]
+    const curveTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, curveTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAX_CURVES, 2, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.useProgram(program);
+    gl.uniform1i(u_curves_loc, 0);
 
     // UI Elements
     const weightXEl = document.getElementById('weight-x');
@@ -409,23 +439,23 @@ function start() {
     attachSliderUpdate(slantEl, slantValEl);
     attachSliderUpdate(tensionEl, tensionValEl);
 
-    // Maximum geometric limits setup
-    const MAX_CURVES = 350;
-    let p0Array = new Float32Array(MAX_CURVES * 2);
-    let p1Array = new Float32Array(MAX_CURVES * 2);
-    let p2Array = new Float32Array(MAX_CURVES * 2);
-    let kinksArray = new Float32Array(MAX_CURVES);
+    // Per-frame upload scratch: two RGBA32F rows of up to MAX_CURVES texels each
+    const curveTexData = new Float32Array(MAX_CURVES * 8);
+    const kinksArray = new Float32Array(MAX_CURVES);
 
     // Pre-allocate tracking arrays
-    let currentPoints = basePoints.map(p => ({x: p.x, y: p.y}));
     let normals = new Array(currentPoints.length).fill(null).map(() => ({x: 0, y: 0, count: 0}));
-    
+
     // Pan & Zoom Camera State
     let camZoom = 1.0;
     let camOffsetX = 0.0;
     let camOffsetY = 0.0;
     let isDragging = false;
     let lastMouse = {x:0, y:0};
+
+    // The shader maps the viewport so that the screen height always spans 2.5
+    // logical units, so one CSS pixel of mouse travel = 2.5 / clientHeight units.
+    const uvPerPixel = () => 2.5 / canvas.clientHeight;
 
     window.addEventListener('mousedown', (e) => {
         if(e.button !== 0 || e.target !== canvas) return;
@@ -435,35 +465,46 @@ function start() {
     window.addEventListener('mouseup', () => isDragging = false);
     window.addEventListener('mousemove', (e) => {
         if(isDragging) {
-            let dx = (e.clientX - lastMouse.x) / min(canvas.width, canvas.height) * 2.0;
-            let dy = -(e.clientY - lastMouse.y) / min(canvas.width, canvas.height) * 2.0;
-            camOffsetX += dx;
-            camOffsetY += dy;
+            const s = uvPerPixel();
+            camOffsetX += (e.clientX - lastMouse.x) * s;
+            camOffsetY -= (e.clientY - lastMouse.y) * s;
             lastMouse = {x: e.clientX, y: e.clientY};
         }
     });
-    window.addEventListener('wheel', (e) => {
+    // Bound to the canvas (not window) so the wheel does nothing over the UI panel
+    canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
-        let zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-        camZoom *= zoomFactor;
-        camZoom = Math.max(0.1, Math.min(camZoom, 50.0));
+        const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+        const newZoom = Math.max(0.1, Math.min(camZoom * zoomFactor, 50.0));
+
+        // Zoom about the cursor: keep the world point under the pointer fixed
+        const rect = canvas.getBoundingClientRect();
+        const s = uvPerPixel();
+        const ux = (e.clientX - rect.left - rect.width / 2) * s;
+        const uy = (rect.height / 2 - (e.clientY - rect.top)) * s;
+        const ratio = newZoom / camZoom;
+        camOffsetX = ux - (ux - camOffsetX) * ratio;
+        camOffsetY = uy - (uy - camOffsetY) * ratio;
+        camZoom = newZoom;
     }, {passive: false});
 
     const overlayCanvas = document.getElementById('overlay-canvas');
     const overlayCtx = overlayCanvas.getContext('2d');
     const showSkeletonEl = document.getElementById('show-skeleton');
-    
-    function min(a, b) { return a < b ? a : b; }
 
     function render(timeMs) {
         const time = timeMs / 1000.0;
 
-        // Resize handler
-        if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-            overlayCanvas.width = window.innerWidth;
-            overlayCanvas.height = window.innerHeight;
+        // Resize handler — render at device resolution (capped at 2x) for crisp
+        // edges on HiDPI displays; the canvases stay at 100vw/100vh CSS size.
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const pxWidth = Math.round(window.innerWidth * dpr);
+        const pxHeight = Math.round(window.innerHeight * dpr);
+        if (canvas.width !== pxWidth || canvas.height !== pxHeight) {
+            canvas.width = pxWidth;
+            canvas.height = pxHeight;
+            overlayCanvas.width = pxWidth;
+            overlayCanvas.height = pxHeight;
             gl.viewport(0, 0, canvas.width, canvas.height);
         }
 
@@ -490,18 +531,21 @@ function start() {
         }
 
         // --- 1. TENSION MORPHING ---
-        // Radically alter the structural shape based on slider
-        // Pull down the main peaks
-        currentPoints[2].y -= tension * 0.9;
-        currentPoints[16].y -= tension * 0.45;
-        
-        // Push the side legs inward to make it rounder/shorter
-        currentPoints[1].x -= tension * 0.5;
-        currentPoints[3].x += tension * 0.5;
+        // Radically alter the structural shape based on slider. The indices target
+        // the built-in "A" topology, so guard against smaller imported glyphs.
+        if (currentPoints.length > 19) {
+            // Pull down the main peaks
+            currentPoints[2].y -= tension * 0.9;
+            currentPoints[16].y -= tension * 0.45;
 
-        // Collapse the crossbar
-        currentPoints[9].y -= tension * 0.3;
-        currentPoints[19].y -= tension * 0.15;
+            // Push the side legs inward to make it rounder/shorter
+            currentPoints[1].x -= tension * 0.5;
+            currentPoints[3].x += tension * 0.5;
+
+            // Collapse the crossbar
+            currentPoints[9].y -= tension * 0.3;
+            currentPoints[19].y -= tension * 0.15;
+        }
 
 
         // --- 2. BREATHING / VIBRATION EFFECT ---
@@ -571,24 +615,31 @@ function start() {
         }
 
         // --- Upload to WebGL ---
-        for(let i=0; i<curvesDef.length; i++) {
+        // Pack the two texture rows back to back: texSubImage2D below uploads a
+        // numCurves-wide region, so row 1 starts at numCurves * 4 floats.
+        const numCurves = curvesDef.length;
+        for(let i=0; i<numCurves; i++) {
             const p0 = currentPoints[curvesDef[i][0]];
             const p1 = currentPoints[curvesDef[i][1]];
             const p2 = currentPoints[curvesDef[i][2]];
 
-            p0Array[i*2] = p0.x;     p0Array[i*2+1] = p0.y;
-            p1Array[i*2] = p1.x;     p1Array[i*2+1] = p1.y;
-            p2Array[i*2] = p2.x;     p2Array[i*2+1] = p2.y;
+            const r0 = i * 4;
+            const r1 = (numCurves + i) * 4;
+            curveTexData[r0]   = p0.x;  curveTexData[r0+1] = p0.y;
+            curveTexData[r0+2] = p1.x;  curveTexData[r0+3] = p1.y;
+            curveTexData[r1]   = p2.x;  curveTexData[r1+1] = p2.y;
+            curveTexData[r1+2] = kinksArray[i];
+            curveTexData[r1+3] = 0.0;
         }
 
         gl.useProgram(program);
 
-        gl.uniform2fv(u_p0_loc, p0Array);
-        gl.uniform2fv(u_p1_loc, p1Array);
-        gl.uniform2fv(u_p2_loc, p2Array);
-        gl.uniform1fv(u_kink_flags_loc, kinksArray);
-        
-        gl.uniform1i(u_num_curves_loc, curvesDef.length);
+        if (numCurves > 0) {
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, numCurves, 2, gl.RGBA, gl.FLOAT,
+                curveTexData.subarray(0, numCurves * 8));
+        }
+
+        gl.uniform1i(u_num_curves_loc, numCurves);
         gl.uniform1i(u_render_mode_loc, renderMode);
         gl.uniform1i(u_show_flaws_loc, showFlaws ? 1 : 0);
         
@@ -606,22 +657,21 @@ function start() {
         if (showSkeletonEl.checked) {
             const hw = overlayCanvas.width / 2;
             const hh = overlayCanvas.height / 2;
-            const minDim = min(overlayCanvas.width, overlayCanvas.height) / 2;
-            // The unscaled UV is exactly (v_uv - 0.5)*2.5 with aspect ratio applied.
-            const aspectX = canvas.width / canvas.height;
+            // Exact inverse of the shader mapping: uv spans 2.5 units over the
+            // canvas height, and the aspect correction means the x scale is the
+            // same height-derived factor.
+            const pxPerUv = overlayCanvas.height / 2.5;
 
             function toScreen(pt) {
-                // To reverse shader uv offset
-                let mappedX = (pt.x * camZoom + camOffsetX);
-                let mappedY = (pt.y * camZoom + camOffsetY);
-                // Inverse map from [-1.25, 1.25] space to pixels
+                const mappedX = pt.x * camZoom + camOffsetX;
+                const mappedY = pt.y * camZoom + camOffsetY;
                 return {
-                    x: hw + (mappedX / (1.25 * aspectX)) * minDim,
-                    y: hh - (mappedY / 1.25) * minDim
+                    x: hw + mappedX * pxPerUv,
+                    y: hh - mappedY * pxPerUv
                 };
             }
 
-            overlayCtx.lineWidth = 1.5;
+            overlayCtx.lineWidth = 1.5 * dpr;
             // Draw Tangents
             overlayCtx.strokeStyle = 'rgba(168, 85, 247, 0.4)'; // Secondary color
             overlayCtx.beginPath();
@@ -640,7 +690,7 @@ function start() {
                 let p = toScreen(currentPoints[i]);
                 overlayCtx.fillStyle = '#6366f1'; // Primary color
                 overlayCtx.beginPath();
-                overlayCtx.arc(p.x, p.y, 4, 0, Math.PI*2);
+                overlayCtx.arc(p.x, p.y, 4 * dpr, 0, Math.PI*2);
                 overlayCtx.fill();
             }
         }
@@ -659,28 +709,31 @@ let activeFont = null;
 // Convert opentype.js paths into geometric curves
 function updateFontPreview(text) {
     if (!activeFont || !text) return;
-    
+
     const path = activeFont.getPath(text, 0, 0, 1000);
     const newPoints = [];
     const newCurves = [];
-    let pid = 0;
-    
+
     let currentX = 0, currentY = 0;
-    
-    // Bounds tracking
-    const bounds = {minX:10000, maxX:-10000, minY:10000, maxY:-10000};
-    
-    path.commands.forEach(cmd => {
-        let x = cmd.x || currentX;
-        let y = cmd.y || currentY;
+
+    // Bounds tracking — include control points (x1/y1, x2/y2) so wide curve
+    // handles can't push geometry outside the normalized viewport.
+    const bounds = {minX:Infinity, maxX:-Infinity, minY:Infinity, maxY:-Infinity};
+    const track = (x, y) => {
+        if (typeof x !== 'number' || typeof y !== 'number') return;
         bounds.minX = Math.min(bounds.minX, x);
         bounds.maxX = Math.max(bounds.maxX, x);
-        // opentype.js Y-axis is inverted relative to webgl mathematical plane often, but let's map generally
         bounds.minY = Math.min(bounds.minY, y);
         bounds.maxY = Math.max(bounds.maxY, y);
+    };
+    path.commands.forEach(cmd => {
+        track(cmd.x, cmd.y);
+        track(cmd.x1, cmd.y1);
+        track(cmd.x2, cmd.y2);
     });
-    
-    let scale = 1.6 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
+    if (!isFinite(bounds.minX)) return; // nothing drawable (e.g. whitespace only)
+
+    let scale = 1.6 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 1e-6);
     let offsetX = -(bounds.minX + bounds.maxX) * 0.5 * scale;
     let offsetY = -(bounds.minY + bounds.maxY) * 0.5 * scale;
 
@@ -717,12 +770,13 @@ function updateFontPreview(text) {
         else if (cmd.type === 'Z') { /* Path closed */ }
     });
 
-    if (newCurves.length > 0 && newCurves.length <= 350) {
-        basePoints.length = 0; basePoints.push(...newPoints);
-        curvesDef.length = 0; curvesDef.push(...newCurves);
-    } else {
-        alert(`String too complex. Contains ${newCurves.length} geometric curves (Max 350). Try fewer characters.`);
+    if (newCurves.length === 0) return; // keep the current shape rather than alerting
+    if (newCurves.length > MAX_CURVES) {
+        alert(`String too complex. Contains ${newCurves.length} geometric curves (Max ${MAX_CURVES}). Try fewer characters.`);
+        return;
     }
+    basePoints.length = 0; basePoints.push(...newPoints);
+    curvesDef.length = 0; curvesDef.push(...newCurves);
 }
 
 // Robust parsing function Integration
@@ -742,17 +796,23 @@ function addDragAndDropSupport() {
 
     document.body.addEventListener('dragleave', (e) => {
         e.preventDefault();
-        if (e.target === dropZone) dropZone.classList.remove('active');
+        // relatedTarget is null when the drag exits the window entirely — without
+        // this the full-screen overlay stays up and blocks all UI interaction.
+        if (e.target === dropZone || !e.relatedTarget) dropZone.classList.remove('active');
     });
 
     document.body.addEventListener('drop', (e) => {
         e.preventDefault();
         dropZone.classList.remove('active');
-        
+
         const file = e.dataTransfer.files[0];
         if (!file) return;
-        
-        if (file.name.endsWith('.ttf') || file.name.endsWith('.otf') || file.name.endsWith('.woff')) {
+        const name = file.name.toLowerCase();
+
+        if (name.endsWith('.ttf') || name.endsWith('.otf') || name.endsWith('.woff')) {
+            if (typeof opentype === 'undefined') {
+                return alert('OpenType.js failed to load (offline or CDN blocked) — .ttf/.otf parsing is unavailable.');
+            }
             const reader = new FileReader();
             reader.onload = (ev) => {
                 try {
@@ -767,8 +827,8 @@ function addDragAndDropSupport() {
             reader.readAsArrayBuffer(file);
             return;
         }
-        
-        if (!file.name.endsWith('.glif')) return alert('Please drop a valid .ttf, .otf, or .glif file.');
+
+        if (!name.endsWith('.glif')) return alert('Please drop a valid .ttf, .otf, or .glif file.');
         
         activeFont = null;
         liveTextUI.style.display = 'none';
@@ -777,38 +837,47 @@ function addDragAndDropSupport() {
         reader.onload = (ev) => {
             const parser = new DOMParser();
             const xml = parser.parseFromString(ev.target.result, "text/xml");
-            
+            if (xml.querySelector("parsererror")) {
+                return alert('Could not parse .glif file — invalid XML.');
+            }
+
             const newPoints = [];
             const newCurves = [];
             let pid = 0;
-            const contours = xml.querySelectorAll("contour");
-            
+            const contours = Array.from(xml.querySelectorAll("contour"));
+
+            // Normalize against the bounds of the WHOLE glyph, not per contour —
+            // per-contour scaling blows counters (holes) up to the outline's size.
+            const bounds = {minX:Infinity, maxX:-Infinity, minY:Infinity, maxY:-Infinity};
             contours.forEach(contour => {
-                const pts = Array.from(contour.querySelectorAll("point"));
-                let firstPtIdx = pid;
-                const bounds = {minX:10000, maxX:-10000, minY:10000, maxY:-10000};
-                
-                // Extremely generalized font downscaling 
-                // We'll normalize coordinates universally here
-                pts.forEach(pt => {
-                    let x = parseFloat(pt.getAttribute("x"));
-                    let y = parseFloat(pt.getAttribute("y"));
+                contour.querySelectorAll("point").forEach(pt => {
+                    const x = parseFloat(pt.getAttribute("x"));
+                    const y = parseFloat(pt.getAttribute("y"));
+                    if (isNaN(x) || isNaN(y)) return;
                     bounds.minX = Math.min(bounds.minX, x);
                     bounds.maxX = Math.max(bounds.maxX, x);
                     bounds.minY = Math.min(bounds.minY, y);
                     bounds.maxY = Math.max(bounds.maxY, y);
                 });
-                
-                let scale = 1.6 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY);
-                let offsetX = -(bounds.minX + bounds.maxX) * 0.5 * scale;
-                let offsetY = -(bounds.minY + bounds.maxY) * 0.5 * scale;
+            });
+            if (!isFinite(bounds.minX)) {
+                return alert('No contour points found in this .glif file.');
+            }
+
+            const scale = 1.6 / Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 1e-6);
+            const offsetX = -(bounds.minX + bounds.maxX) * 0.5 * scale;
+            const offsetY = -(bounds.minY + bounds.maxY) * 0.5 * scale;
+
+            contours.forEach(contour => {
+                const pts = Array.from(contour.querySelectorAll("point"));
+                let firstPtIdx = pid;
 
                 for(let i=0; i<pts.length; i++) {
                     let x = parseFloat(pts[i].getAttribute("x")) * scale + offsetX;
                     let y = parseFloat(pts[i].getAttribute("y")) * scale + offsetY;
                     newPoints.push({id: pid++, x: x, y: y});
                 }
-                
+
                 // Pair them into rough quadratics for visualization
                 for(let i=0; i<pts.length; i++) {
                     let p0 = firstPtIdx + i;
@@ -818,11 +887,11 @@ function addDragAndDropSupport() {
                 }
             });
 
-            if (newCurves.length > 0 && newCurves.length <= 350) {
+            if (newCurves.length > 0 && newCurves.length <= MAX_CURVES) {
                 basePoints.length = 0; basePoints.push(...newPoints);
                 curvesDef.length = 0; curvesDef.push(...newCurves);
             } else {
-                alert("File contains too many curves for standalone browser prototype (" + newCurves.length + "/350 max).");
+                alert("File contains too many curves for standalone browser prototype (" + newCurves.length + "/" + MAX_CURVES + " max).");
             }
         };
         reader.readAsText(file);
@@ -830,86 +899,116 @@ function addDragAndDropSupport() {
 }
 
 
+// Build a UFO .glif document from the LIVE morphed geometry (weight/slant/tension
+// applied), walking the curve list so on-curve points get type="qcurve", control
+// points stay untyped (offcurve), and discontinuities start a new contour.
+function buildGlifXML() {
+    const fmt = (pt) => `x="${Math.round((pt.x + 1.0) * 500.0)}" y="${Math.round((pt.y + 1.0) * 500.0)}"`;
+    const samePos = (a, b) => Math.abs(a.x - b.x) < 1e-3 && Math.abs(a.y - b.y) < 1e-3;
+
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<glyph name="morphed_export" format="2">\n  <outline>\n`;
+    let contourStart = null;
+
+    for (let i = 0; i < curvesDef.length; i++) {
+        const p0 = currentPoints[curvesDef[i][0]];
+        const p1 = currentPoints[curvesDef[i][1]];
+        const p2 = currentPoints[curvesDef[i][2]];
+
+        const prevEnd = i > 0 ? currentPoints[curvesDef[i-1][2]] : null;
+        if (!prevEnd || !samePos(prevEnd, p0)) {
+            if (contourStart) xml += `    </contour>\n`;
+            xml += `    <contour>\n      <point ${fmt(p0)} type="qcurve"/>\n`;
+            contourStart = p0;
+        }
+
+        xml += `      <point ${fmt(p1)}/>\n`;
+
+        // Suppress the closing on-curve point when the contour wraps back to its
+        // start — UFO contours are implicitly closed.
+        const nextStart = i + 1 < curvesDef.length ? currentPoints[curvesDef[i+1][0]] : null;
+        const endsContour = !nextStart || !samePos(nextStart, p2);
+        if (!(endsContour && samePos(p2, contourStart))) {
+            xml += `      <point ${fmt(p2)} type="qcurve"/>\n`;
+        }
+    }
+    if (contourStart) xml += `    </contour>\n`;
+    xml += `  </outline>\n</glyph>`;
+    return xml;
+}
+
+// Build an SVG from the live morphed geometry. fill-rule="nonzero" matches the
+// shader's winding test (winding != 0).
+function buildSVG() {
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 4 4" width="1024" height="1024">\n`;
+    // Invert Y axis to match graphic design space (WebGL Y points up, SVG Y points down)
+    svg += `  <g transform="scale(1, -1)">\n`;
+    svg += `    <path fill="#6366f1" fill-rule="nonzero" d="`;
+
+    for(let i=0; i<curvesDef.length; i++) {
+        let p0 = currentPoints[curvesDef[i][0]];
+        let p1 = currentPoints[curvesDef[i][1]];
+        let p2 = currentPoints[curvesDef[i][2]];
+
+        // Continuous path logic (start subpath if P0 doesn't match last P2)
+        if (i === 0) {
+            svg += `M ${p0.x} ${p0.y} `;
+        } else {
+            let lastP2 = currentPoints[curvesDef[i-1][2]];
+            if (Math.abs(lastP2.x - p0.x) > 0.001 || Math.abs(lastP2.y - p0.y) > 0.001) {
+                svg += `Z M ${p0.x} ${p0.y} `;
+            }
+        }
+        svg += `Q ${p1.x} ${p1.y} ${p2.x} ${p2.y} `;
+    }
+    svg += `Z" />\n  </g>\n</svg>`;
+    return svg;
+}
+
+function downloadBlob(content, mimeType, filename) {
+    const blob = new Blob([content], {type: mimeType});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
 // Start application
 window.onload = () => {
     start();
     addDragAndDropSupport();
-    
+
     // Developer Backend Export Agent
     document.getElementById('btn-export').addEventListener('click', () => {
-        if (!basePoints || basePoints.length === 0) return;
-        
-        // Construct standard UFO .glif XML string
-        let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<glyph name="morphed_export" format="2">\n  <outline>\n`;
-        let pidx = 0;
-        xml += `    <contour>\n`;
-        basePoints.forEach(pt => {
-            let px = Math.round((pt.x + 1.0) * 500.0);
-            let py = Math.round((pt.y + 1.0) * 500.0);
-            let type = (pidx % 2 === 0) ? "curve" : "offcurve";
-            xml += `      <point x="${px}" y="${py}" type="${type}"/>\n`;
-            pidx++;
-        });
-        xml += `    </contour>\n  </outline>\n</glyph>`;
-        
-        const blob = new Blob([xml], {type: 'text/xml'});
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `gpu_morphed_${Date.now()}.glif`;
-        a.click();
-        URL.revokeObjectURL(url);
+        if (curvesDef.length === 0) return;
+        downloadBlob(buildGlifXML(), 'text/xml', `gpu_morphed_${Date.now()}.glif`);
     });
 
-    // SDF / Image Exporter
+    // SDF / Image Exporter — toBlob avoids data-URL size limits on large canvases
     document.getElementById('btn-export-png').addEventListener('click', () => {
         const c = document.getElementById('webgl-canvas');
-        const url = c.toDataURL('image/png');
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `gpu_texture_asset_${Date.now()}.png`;
-        a.click();
+        c.toBlob((blob) => {
+            if (!blob) return alert('PNG capture failed.');
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `gpu_texture_asset_${Date.now()}.png`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }, 'image/png');
     });
 
     // SVG Vector Asset Exporter
     document.getElementById('btn-export-svg').addEventListener('click', () => {
-        if (!basePoints || basePoints.length === 0) return;
-        // The mathematical viewport maps roughly from -1.5 to 1.5. 
-        // We'll map the viewbox identically so SVGs drop right in perfectly aligned.
-        let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 4 4" width="1024" height="1024">\n`;
-        // Invert Y axis to match graphic design space (WebGL Y points up, SVG Y points down)
-        svg += `  <g transform="scale(1, -1)">\n`; 
-        svg += `    <path fill="#6366f1" fill-rule="evenodd" d="`;
-        
-        for(let i=0; i<curvesDef.length; i++) {
-            let p0 = currentPoints[curvesDef[i][0]];
-            let p1 = currentPoints[curvesDef[i][1]];
-            let p2 = currentPoints[curvesDef[i][2]];
-            
-            // Continuous path logic (start subpath if P0 doesn't match last P2)
-            if (i === 0) {
-                svg += `M ${p0.x} ${p0.y} `;
-            } else {
-                let lastP2 = currentPoints[curvesDef[i-1][2]];
-                if (Math.abs(lastP2.x - p0.x) > 0.001 || Math.abs(lastP2.y - p0.y) > 0.001) {
-                    svg += `Z M ${p0.x} ${p0.y} `;
-                }
-            }
-            svg += `Q ${p1.x} ${p1.y} ${p2.x} ${p2.y} `;
-        }
-        svg += `Z" />\n  </g>\n</svg>`;
-        
-        const blob = new Blob([svg], {type: 'image/svg+xml'});
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `vector_shape_${Date.now()}.svg`;
-        a.click();
-        URL.revokeObjectURL(url);
+        if (curvesDef.length === 0) return;
+        downloadBlob(buildSVG(), 'image/svg+xml', `vector_shape_${Date.now()}.svg`);
     });
-    
+
     // UX Research: Add keyboard shortcut to hide UI
     window.addEventListener('keydown', (e) => {
+        // Don't hijack typing in the live-text field (or any future text input)
+        if (e.target.matches('input[type="text"], textarea, select')) return;
         if (e.key.toLowerCase() === 'h') {
             const panel = document.querySelector('.controls-panel');
             if (panel) {
