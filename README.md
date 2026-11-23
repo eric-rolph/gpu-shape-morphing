@@ -1,6 +1,10 @@
 # GPU Font Engine (Real-Time Vector Morphing)
 
-> A blazing fast, zero-dependency WebGL 2.0 demonstration of rendering and morphing complex vector shapes purely with mathematics in the fragment shader.
+[![Deploy to Pages](https://github.com/eric-rolph/gpu-shape-morphing/actions/workflows/pages.yml/badge.svg)](https://github.com/eric-rolph/gpu-shape-morphing/actions/workflows/pages.yml)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-GitHub%20Pages-38bdf8?logo=github)](https://eric-rolph.github.io/gpu-shape-morphing/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-34d399)](LICENSE)
+
+> A blazing fast, zero-dependency WebGL 2.0 demonstration of rendering and morphing complex vector shapes purely with mathematics in the fragment shader. **[Launch Live WebGL Demo →](https://eric-rolph.github.io/gpu-shape-morphing/)**
 
 ![Demo](demo.png)
 
